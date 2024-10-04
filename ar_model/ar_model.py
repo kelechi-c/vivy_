@@ -21,13 +21,14 @@ encodec_model.eval()
 tokenizer = AutoTokenizer.from_pretrained(
     model_configs.llama_id,
 )
+
 # Llama model architecture, for initial experiments
 llama_config = LlamaConfig(
-    num_attention_heads=8,
-    num_hidden_layers=16,
+    num_attention_heads=16,
+    num_hidden_layers=8,
     num_key_value_heads=4,
-    hidden_size=2048,
-    intermediate_size=8192,
-    head_dim=32,
+    hidden_size=1024,
+    intermediate_size=4096,
 )
+
 tiny_llama = LlamaModel(config=llama_config)
