@@ -30,3 +30,5 @@ Updates:
 - [290924] - Model and starter code. Most of the audio utils had already been written for `canary_`, so I just tweaked them.
 - [021024] - Had a minor break during eams, wrote the training loop and dataloading script. Collected useful datasets
 - [041024] - Finally got the training to work/start. Test run with minimal data/batch_size/input_length
+- [051024] - Training run didn't go well. Decided to follow a different methodology from Anygpt, maybe distilling MusicGen?
+- [061024] - Taking a paus once again
