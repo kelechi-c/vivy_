@@ -1,42 +1,51 @@
-from .pretrained_models import mini_llm_tokenizer
-from ..configs import config
-from ..music_data.audio_utils import read_audio
-from .canary import *
+import soundfile as sf
 import os
 import torchaudio
 import pydub
 import re
 from typing import Literal
 import random
-import librosa
 import numpy as np
 from torch import nn
 import gc
 import torch
+import wandb
 
 
 class config:
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    outpath = "samples"
 
 
 class model_configs:
     encodec_id = "facebook/encodec_32khz"
     llama_id = "meta-llama/Llama-3.2-1B"
-    canary_id = "tensorkelechi/canary_mini"
+    canary_id = "tensorkelechi/kaminari_v1"
 
 
 class data_configs:
     sample_rate = 32000
-    split = 1000
-    max_duration = 10
+    split = 4000
+    max_duration = 5
     dtype = torch.float16
     batch_size = 4
     dataset_id = "benjamin-paine/freesound-laion-640k"
     mini_dataset_id = "lewtun/music_genres"
-    processed_repo_id = "tensorkelechi/freesound_mini"
+    # processed_repo_id = "tensorkelechi/freesound_mini"
 
 
-sample_rate = audio_processor.sample_rate  # or data_configs.sample_rate
+class train_configs:
+    precision = torch.float16
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    grad_steps = 4
+    epochs = 1
+    lr = 1e-4
+    sft_file = "kaminari.safetensors"
+    model_file = "kaminari.pth"
+    outpath = "kaminari"
+
+
+os.mkdir(config.outpath)
 
 music_prefix = "🎶"
 start_of_music = "<somu>"
@@ -52,29 +61,6 @@ music_tokens = {
 }
 
 
-def modality_tokens_to_string(tokens):
-    """
-    Convert audio/music tokens to a single string with prefix and postfix.
-    """
-    prefix = music_tokens["prefix"]
-    start = music_tokens["sos"]
-    end = music_tokens["eos"]
-
-    tokens_str = []
-    # music tokens are 2-dim array
-    # Convert each token to its corresponding string representation
-    for idx in range(len(tokens[0])):
-        for layer_idx in range(len(tokens)):
-            tokens_str.append(
-                f"<{prefix}{tokens[layer_idx][idx] + music_codebook_size * layer_idx}>"
-            )
-
-    tokens_string = "".join(tokens_str)
-    tokens_string = f"{start}{tokens_string}{end}"
-
-    return tokens_string
-
-
 def freeze_model(model: nn.Module):
     for param in model.parameters():
         param.requires_grad = False
@@ -88,14 +74,13 @@ def clear_mem():
 
 def trimpad_audio(audio):
     samples = int(data_configs.sample_rate * data_configs.max_duration)
-    audio = audio.numpy()
 
     if len(audio) > samples:
         audio = audio[:samples]
 
     else:
         pad_width = samples - len(audio)
-        audio = np.pad(audio.numpy(), (0, pad_width), mode="reflect")
+        audio = np.pad(audio, (0, pad_width), mode="reflect")
 
     return torch.as_tensor(audio)
 
@@ -142,13 +127,6 @@ Code for audio/music tokenization and model processing
 """
 
 
-# configure tokenizer, add tokens
-# vocab_ = mini_llm_tokenizer.get_vocab().keys()
-# vocab_size = len(vocab_)
-
-# resized model embeddings in canary.py
-
-
 def prepare_tokenizer(tokenizer, tokens: list):
     special_tokens = [f"<{music_prefix}{x}>" for x in range(music_vocab_size)]
     tokenizer.add_tokens(special_tokens)
@@ -158,31 +136,34 @@ def prepare_tokenizer(tokenizer, tokens: list):
 
 
 # encoding/compressing music/audio waveform to tokens
-def encode_music(audio, encodec_model=encodec_model, audio_processor=audio_processor):
-    audio_array = read_audio(audio)  # read audio_file to waveform
+def encode_music(audio, encodec_model, audio_processor):
+    audio_array = trimpad_audio(audio)
 
     audio_proc = audio_processor(
-        raw_audio=audio_array, sample_rate=sample_rate
+        raw_audio=audio_array,
+        sampling_rate=data_configs.sample_rate,
+        return_tensors="pt",
     )  # preprocess audio waveform for encoding
 
-    masks = audio_proc["input_masks"]  # get processor masks for decoding
+    masks = audio_proc["padding_mask"]  # get processor masks for decoding
 
     with torch.no_grad():
         audio_tokens = encodec_model.encode(
             # tokenize/encode with pretrained neural codec
             audio_proc["input_values"],
-            audio_proc["input_masks"],
+            audio_proc["padding_mask"],
         )
+    audio_codes = audio_tokens.audio_codes
 
-    return audio_tokens.audio_codes, masks
+    return audio_codes[0][0], masks
 
 
 # dealing with LLM string output
-def tokens_to_string(tokens, modality="music"):
+def tokens2string(tokens):
     """
     Convert visual tokens to a single string with prefix and postfix.
     """
-    prefix = music_tokens["prefix"]
+    prefix = music_prefix
     start = music_tokens["sos"]
     end = music_tokens["eos"]
 
@@ -199,7 +180,9 @@ def tokens_to_string(tokens, modality="music"):
                 f"<{prefix}{tokens[layer_idx][idx] + music_codebook_size * layer_idx}>"
             )
 
-    return start + "".join(tokens_str) + end
+    tokens_string = "".join(tokens_str)
+    tokens_string = f" - {start}{tokens_string}{end}"
+    return tokens_string
 
 
 def extractor2(text, tag1=start_of_music, tag2=end_of_music):
@@ -221,6 +204,7 @@ def extractor2(text, tag1=start_of_music, tag2=end_of_music):
         except Exception as e:
             print(e)
             extracted_text = text
+
         return extracted_text
 
 
@@ -248,6 +232,85 @@ def content2rvq_codes(content, codebook_size=2048, codebook_num=4):
 
 def decode_music(content):
     # codes = content2rvq_codes(content, music_codebook_size, music_codebook_num)
-    music = encodec_model.decode(content, [None])
+    music = encodec_model.decode(content.cpu(), [None])
+    #     print(f'decoded = {music}')
     music = music[0].squeeze(0).detach().cpu()
+    print(f"decoded audio = {music.shape}")
     return music
+
+
+def _postprocess(input):
+    extract = extractor2(input)
+    reconstruct_codes = content2rvq_codes(extract)
+    print(f"recoded {reconstruct_codes.shape}")
+    waveform = decode_music(reconstruct_codes)
+
+    waveform = waveform[0].squeeze(0).detach().cpu()
+
+    return waveform
+
+
+@torch.no_grad()
+def bird_call(
+    prompt, model, tokenizer=tokenizer
+):  # prompt might be just a class/single word/description for v1
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        padding="max_length",
+        max_length=1024,
+    )
+
+    input_ids = inputs["input_ids"].to(config.device)
+    attn_mask = inputs["attention_mask"].to(config.device)
+
+    gen_tokens = model(input_ids=input_ids, attention_mask=attn_mask)[0]
+
+    gen_tokens = model.lm_head(gen_tokens)
+    gen_tokens = gen_tokens.argmax(dim=-1)[0]
+
+    tokens = tokenizer.decode(gen_tokens.cpu(), skip_special_tokens=True)
+    print(tokens)
+    output = _postprocess(tokens)
+    print(f"postprocessed: {output}")
+
+    return output
+
+
+def count_params(model: nn.Module):
+    p_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    return p_count
+
+
+def clearmem():
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+def logger(model) -> None:
+    wandb.login()
+    wandb.init(project="kaminari_v1", name="audiogen-sandbox-5")
+    wandb.watch(model)
+
+
+logger(model)
+
+
+@torch.no_grad
+def epoch_sample(model: LlamaModel = model, prompt="classical"):
+    sample_tokens = bird_call(prompt, model, tokenizer)
+    sample_numpy = sample_tokens.cpu().numpy().astype(np.float32)
+    print(sample_numpy.shape)
+    print(sample_numpy.dtype)
+
+    now = datetime.datetime.now()
+    filename = now.strftime("%m%d_%H%M%S") + ".wav"
+    file_name = os.path.join(config.outpath, filename)
+
+    sf.write(file_name, sample_numpy, data_configs.sample_rate)
+    #     torchaudio.save(file_name, sample_tokens, data_configs.sample_rate)#, channels_first=True)
+    print("saved: ", file_name)
+
+    return os.path.join(config.outpath, filename)
